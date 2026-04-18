@@ -60,20 +60,26 @@ const HOURS_COLORS: Record<string, string> = {
 };
 
 
-// ── OneDrive / MSAL Configuration ────────────────────────────────────
+// ── MSAL + SharePoint (Teams) Configuration ──────────────────────────
+// Data is stored in your BCH Teams SharePoint site so ALL colleagues
+// read and write the exact same file regardless of who they are.
+const TENANT_ID  = "fcd6a9af-1cde-4b3b-84bc-2eb80e1a40d9";
+const GROUP_ID   = "d1ce80cf-d776-4047-b2c5-c329b2262789"; // BCH Teams group
+const SP_FILE    = "BCH_HR_Data.json";   // file lives in Teams > Documents
+
 const msalConfig = {
   auth: {
     clientId: "9982e25d-66bc-41fa-b62b-2e73f6a96ea0",
-    authority: "https://login.microsoftonline.com/fcd6a9af-1cde-4b3b-84bc-2eb80e1a40d9",
+    authority: `https://login.microsoftonline.com/${TENANT_ID}`,
     redirectUri: "https://bch-hr.vercel.app/",
     navigateToLoginRequestUrl: false,
   },
   cache: { cacheLocation: "localStorage", storeAuthStateInCookie: true }
 };
 const msalInstance = new PublicClientApplication(msalConfig);
-const GRAPH_SCOPES = ["Files.ReadWrite", "User.Read"];
-const OD_FILE = "BCH_HR_Data.json"; // one shared file in OneDrive root
+const GRAPH_SCOPES = ["Files.ReadWrite.All", "Sites.ReadWrite.All", "User.Read"];
 
+// ── Get access token (silent first, popup fallback) ───────────────────
 async function getToken(): Promise<string> {
   await msalInstance.initialize();
   const accounts = msalInstance.getAllAccounts();
@@ -87,20 +93,45 @@ async function getToken(): Promise<string> {
   }
 }
 
+// ── Get the SharePoint drive ID for the Teams group (cached) ─────────
+let _driveId: string | null = null;
+async function getDriveId(token: string): Promise<string> {
+  if (_driveId) return _driveId;
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/groups/${GROUP_ID}/drive`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) throw new Error(`Could not get Teams drive: ${res.status}`);
+  const data = await res.json();
+  _driveId = data.id;
+  return data.id;
+}
+
+// ── Load shared data file from Teams SharePoint ───────────────────────
 async function odLoad(): Promise<any | null> {
-  const token = await getToken();
-  const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${OD_FILE}:/content`,
-    { headers: { Authorization: `Bearer ${token}` } });
-  if (res.status === 404) return null;
+  const token   = await getToken();
+  const driveId = await getDriveId(token);
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${SP_FILE}:/content`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (res.status === 404) return null;  // first run — file doesn't exist yet
   if (!res.ok) throw new Error(`Load failed ${res.status}`);
   return res.json();
 }
 
+// ── Save shared data file to Teams SharePoint ─────────────────────────
 async function odSave(data: any): Promise<void> {
-  const token = await getToken();
-  const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${OD_FILE}:/content`,
-    { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify(data) });
+  const token   = await getToken();
+  const driveId = await getDriveId(token);
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${SP_FILE}:/content`,
+    {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(data)
+    }
+  );
   if (!res.ok) throw new Error(`Save failed ${res.status}`);
 }
 // ─────────────────────────────────────────────────────────────────────
@@ -392,7 +423,7 @@ export default function App() {
         {!odConnected
           ? <button onClick={connectOD} disabled={syncing}
               style={{...S.btn("#0078d4"),width:"100%",marginTop:12,display:"flex",alignItems:"center",justifyContent:"center",gap:8,opacity:syncing?0.7:1}}>
-              <RefreshCw size={14}/>{syncing?"Connecting…":"🔗 Connect OneDrive"}
+              <RefreshCw size={14}/>{syncing?"Connecting…":"🔗 Sign in with Microsoft"}
             </button>
           : <button onClick={pullOD}
               style={{...S.btn("#10b981"),width:"100%",marginTop:12,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
@@ -401,8 +432,8 @@ export default function App() {
         }
         <div style={{fontSize:10,color:"#64748b",marginTop:10,textAlign:"center"}}>
           {odConnected
-            ? "☁ OneDrive connected — all devices share the same data"
-            : "Connect OneDrive so all colleagues see the same data"}
+            ? "☁ Connected to BCH Teams — all devices share the same data"
+            : "Sign in with your BCH work account — all colleagues share the same data via Teams"}
         </div>
       </div>
     </div>
