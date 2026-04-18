@@ -60,24 +60,50 @@ const HOURS_COLORS: Record<string, string> = {
 };
 
 
-// --- OneDrive Configuration ---
-// You will get your specific Client ID from the Azure Portal later
+// ── OneDrive / MSAL Configuration ────────────────────────────────────
 const msalConfig = {
   auth: {
     clientId: "9982e25d-66bc-41fa-b62b-2e73f6a96ea0",
-    authority: "https://login.microsoftonline.com/fcd6a9af-1cde-4b3b-84bc-2eb80e1a40d9", 
-    redirectUri: "https://bch-hr.vercel.app", // Back to main app
-    navigateToLoginRequestUrl: false, 
+    authority: "https://login.microsoftonline.com/fcd6a9af-1cde-4b3b-84bc-2eb80e1a40d9",
+    redirectUri: "https://bch-hr.vercel.app/",
+    navigateToLoginRequestUrl: false,
   },
-  cache: {
-    cacheLocation: "localStorage",
-    storeAuthStateInCookie: true
-  }
+  cache: { cacheLocation: "localStorage", storeAuthStateInCookie: true }
 };
-
-
 const msalInstance = new PublicClientApplication(msalConfig);
-// ------------------------------------
+const GRAPH_SCOPES = ["Files.ReadWrite", "User.Read"];
+const OD_FILE = "BCH_HR_Data.json"; // one shared file in OneDrive root
+
+async function getToken(): Promise<string> {
+  await msalInstance.initialize();
+  const accounts = msalInstance.getAllAccounts();
+  if (!accounts.length) throw new Error("NOT_SIGNED_IN");
+  try {
+    const r = await msalInstance.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: accounts[0] });
+    return r.accessToken;
+  } catch {
+    const r = await msalInstance.acquireTokenPopup({ scopes: GRAPH_SCOPES });
+    return r.accessToken;
+  }
+}
+
+async function odLoad(): Promise<any | null> {
+  const token = await getToken();
+  const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${OD_FILE}:/content`,
+    { headers: { Authorization: `Bearer ${token}` } });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Load failed ${res.status}`);
+  return res.json();
+}
+
+async function odSave(data: any): Promise<void> {
+  const token = await getToken();
+  const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${OD_FILE}:/content`,
+    { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(data) });
+  if (!res.ok) throw new Error(`Save failed ${res.status}`);
+}
+// ─────────────────────────────────────────────────────────────────────
 
 // --- Helper Functions & Keys ---
 const K = { 
@@ -216,145 +242,188 @@ function BarChart({data,height=110}){
 }
 
 export default function App() {
-  const [employees, setEmployees] = useState([]);
-  const [outlets, setOutlets] = useState(OUTLETS_DEFAULT);
-  const [users, setUsers] = useState(DEFAULT_USERS);
-  const [transfers, setTransfers] = useState([]);
-  const [loaded, setLoaded] = useState(false);
-  const [currentUser, setCurrentUser] = useState(null);
+  const [employees, setEmployees] = useState<any[]>([]);
+  const [outlets, setOutlets]     = useState<string[]>(OUTLETS_DEFAULT);
+  const [users, setUsers]         = useState<any[]>(DEFAULT_USERS);
+  const [transfers, setTransfers] = useState<any[]>([]);
+  const [currentUser, setCurrentUser] = useState<any>(null);
   const [loginForm, setLoginForm] = useState({ username: "", password: "" });
-  const [loginErr, setLoginErr] = useState("");
-  const [tab, setTab] = useState("dashboard");
-  const [syncing, setSyncing] = useState(false);
+  const [loginErr, setLoginErr]   = useState("");
+  const [tab, setTab]             = useState("dashboard");
+  const [odConnected, setOdConnected] = useState(false);
+  const [syncStatus, setSyncStatus]   = useState<"idle"|"loading"|"saving"|"ok"|"error">("idle");
+  const [syncing, setSyncing]         = useState(false);
+  const saveTimer = useRef<any>(null);
 
-// --- Updated OneDrive Sync Function ---
-async function syncWithOneDrive() {
+  // ── Init: check if already signed into OneDrive, load data ──────────
+  useEffect(() => {
+    (async () => {
+      try {
+        await msalInstance.initialize();
+        await msalInstance.handleRedirectPromise();
+        const accounts = msalInstance.getAllAccounts();
+        if (accounts.length > 0) {
+          setOdConnected(true);
+          await pullOD();
+        } else {
+          localLoad();
+        }
+      } catch {
+        localLoad();
+      }
+    })();
+  }, []);
+
+  // ── localStorage helpers (fallback / cache) ──────────────────────────
+  function localLoad() {
+    try {
+      const e = localStorage.getItem(K.emp);      if (e) setEmployees(JSON.parse(e));
+      const o = localStorage.getItem(K.outlets);  if (o) setOutlets(JSON.parse(o));
+      const u = localStorage.getItem(K.users);    if (u) setUsers(JSON.parse(u));
+      const t = localStorage.getItem(K.transfers);if (t) setTransfers(JSON.parse(t));
+    } catch {}
+  }
+  function localSave(emp=employees,out=outlets,usr=users,tr=transfers) {
+    localStorage.setItem(K.emp,       JSON.stringify(emp));
+    localStorage.setItem(K.outlets,   JSON.stringify(out));
+    localStorage.setItem(K.users,     JSON.stringify(usr));
+    localStorage.setItem(K.transfers, JSON.stringify(tr));
+  }
+
+  // ── Pull latest from OneDrive ────────────────────────────────────────
+  async function pullOD() {
+    setSyncStatus("loading");
+    try {
+      const data = await odLoad();
+      if (data) {
+        if (data.employees) setEmployees(data.employees);
+        if (data.outlets)   setOutlets(data.outlets);
+        if (data.users)     setUsers(data.users);
+        if (data.transfers) setTransfers(data.transfers);
+        localSave(data.employees||[], data.outlets||OUTLETS_DEFAULT, data.users||DEFAULT_USERS, data.transfers||[]);
+      }
+      setSyncStatus("ok");
+    } catch (err) {
+      console.error("Pull error:", err);
+      setSyncStatus("error");
+      localLoad();
+    }
+  }
+
+  // ── Auto-save to OneDrive 2s after any change ────────────────────────
+  function scheduleSave(emp=employees,out=outlets,usr=users,tr=transfers) {
+    localSave(emp, out, usr, tr);
+    if (!odConnected) return;
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      setSyncStatus("saving");
+      try {
+        await odSave({ employees:emp, outlets:out, users:usr, transfers:tr, savedAt:new Date().toISOString() });
+        setSyncStatus("ok");
+      } catch { setSyncStatus("error"); }
+    }, 2000);
+  }
+
+  // Wrapped setters — every change triggers auto-save
+  function setEmp(v:any){ const d=typeof v==="function"?v(employees):v; setEmployees(d); scheduleSave(d,outlets,users,transfers); }
+  function setOut(v:any){ const d=typeof v==="function"?v(outlets):v;   setOutlets(d);   scheduleSave(employees,d,users,transfers); }
+  function setUsr(v:any){ const d=typeof v==="function"?v(users):v;     setUsers(d);     scheduleSave(employees,outlets,d,transfers); }
+  function setTr(v:any){  const d=typeof v==="function"?v(transfers):v; setTransfers(d); scheduleSave(employees,outlets,users,d); }
+
+  // ── Connect OneDrive button ──────────────────────────────────────────
+  async function connectOD() {
     setSyncing(true);
     try {
       await msalInstance.initialize();
-
-      // IMPORTANT: This handles the result after the page redirects back
-      const redirectResult = await msalInstance.handleRedirectPromise();
-      if (redirectResult) {
-        console.log("Login Success:", redirectResult.account.username);
-        alert("Connected to Bee Cheng Hiang OneDrive!");
-        return;
+      const accounts = msalInstance.getAllAccounts();
+      if (accounts.length > 0) {
+        setOdConnected(true);
+        await pullOD();
+      } else {
+        await msalInstance.loginRedirect({ scopes: GRAPH_SCOPES, prompt: "select_account" });
       }
-
-      // If not logged in, start the redirect
-      const loginRequest = { 
-        scopes: ["user.read", "Files.ReadWrite"],
-        prompt: "select_account"
-      };
-
-      // This will navigate the WHOLE tab to Microsoft, then back to your app
-      await msalInstance.loginRedirect(loginRequest);
-      
-    } catch (error) {
-      console.error("Sync Error:", error);
-      alert(`Sync Error: ${error.message}`);
-    } finally {
-      setSyncing(false);
-    }
+    } catch (err:any) {
+      alert("OneDrive connection failed: " + err.message);
+    } finally { setSyncing(false); }
   }
 
-  useEffect(() => {
-    try {
-      const e = localStorage.getItem(K.emp); if (e) setEmployees(JSON.parse(e));
-      const o = localStorage.getItem(K.outlets); if (o) setOutlets(JSON.parse(o));
-      const u = localStorage.getItem(K.users); if (u) setUsers(JSON.parse(u));
-      const t = localStorage.getItem(K.transfers); if (t) setTransfers(JSON.parse(t));
-    } catch { }
-    setLoaded(true);
-  }, []);
-
-
-// --- NEW MIDDLE BLOCK: Listens for the OneDrive return signal ---
- useEffect(() => {
-    const initializeMSAL = async () => {
-      try {
-        await msalInstance.initialize();
-        
-        // This is the important part: it checks the URL for the "Success Code"
-        const result = await msalInstance.handleRedirectPromise();
-        
-        if (result) {
-          console.log("OneDrive Connected:", result.account.username);
-          alert("Bee Cheng Hiang OneDrive: Connection Successful!");
-          // Optional: You can now trigger your file upload/download here
-        }
-      } catch (err) {
-        // If it's just a regular page load (no login happening), ignore the error
-        if (err.name !== "BrowserAuthError") {
-          console.error("Auth error:", err);
-        }
-      }
-    };
-    initializeMSAL();
-  }, []);
-
-  // -------------------------------------------------------------
-
-  useEffect(() => {
-    if (loaded) {
-      localStorage.setItem(K.emp, JSON.stringify(employees));
-      localStorage.setItem(K.outlets, JSON.stringify(outlets));
-      localStorage.setItem(K.users, JSON.stringify(users));
-      localStorage.setItem(K.transfers, JSON.stringify(transfers));
-    }
-  }, [employees, outlets, users, transfers, loaded]);
-
+  // ── Login ────────────────────────────────────────────────────────────
   function doLogin() {
-    const u = users.find(u => u.username === loginForm.username.trim());
-    if (!u || u.pwdHash !== hashPwd(loginForm.password)) { 
-      setLoginErr("Invalid username or password."); 
-      return; 
+    const u = users.find((u:any) => u.username === loginForm.username.trim());
+    if (!u || u.pwdHash !== hashPwd(loginForm.password)) {
+      setLoginErr("Invalid username or password."); return;
     }
-    
-    // SAVE TO STORAGE
-    localStorage.setItem("BCH_CURRENT_USER", JSON.stringify(u));
-    
-    setCurrentUser(u);
-    setLoginErr("");
-    setTab(["superadmin", "hrmanager", "hradmin"].includes(u.role) ? "dashboard" : "myprofile");
+    setCurrentUser(u); setLoginErr("");
+    setTab(["superadmin","hrmanager","hradmin"].includes(u.role) ? "dashboard" : "myprofile");
   }
 
+  // ── Sync status badge ────────────────────────────────────────────────
+  const syncBadge = () => {
+    if (!odConnected)          return <span style={{...S.badge("#64748b"),fontSize:9}}>💾 Local only</span>;
+    if (syncStatus==="loading") return <span style={{...S.badge("#6366f1"),fontSize:9}}>⬇ Loading…</span>;
+    if (syncStatus==="saving")  return <span style={{...S.badge("#f59e0b"),fontSize:9}}>⬆ Saving…</span>;
+    if (syncStatus==="ok")      return <span style={{...S.badge("#10b981"),fontSize:9}}>☁ Synced</span>;
+    if (syncStatus==="error")   return <span style={{...S.badge("#ef4444"),fontSize:9}}>⚠ Sync error</span>;
+    return null;
+  };
+
+  // ── Login screen ─────────────────────────────────────────────────────
   if (!currentUser) return (
-    <div style={{ ...S.app, display: "flex", alignItems: "center", justifyContent: "center" }}>
-      <div style={{ ...S.card, width: 340, padding: 32 }}>
-        <div style={{ textAlign: "center", marginBottom: 24 }}>
-          <Database size={40} color="#6366f1" style={{marginBottom: 10}} />
-          <div style={{ fontWeight: 800, fontSize: 18, color: "#6366f1" }}>BCH HR SYSTEM</div>
-          <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>Retail Operations Portal</div>
+    <div style={{ ...S.app, display:"flex", alignItems:"center", justifyContent:"center" }}>
+      <div style={{ ...S.card, width:340, padding:32 }}>
+        <div style={{ textAlign:"center", marginBottom:24 }}>
+          <Database size={40} color="#6366f1" style={{marginBottom:10}}/>
+          <div style={{ fontWeight:800, fontSize:18, color:"#6366f1" }}>BCH HR SYSTEM</div>
+          <div style={{ fontSize:11, color:"#64748b", marginTop:4 }}>Retail Operations Portal</div>
+          <div style={{marginTop:8}}>{syncBadge()}</div>
         </div>
-        <div style={{ marginBottom: 12 }}>
+        <div style={{marginBottom:12}}>
           <label style={S.lbl}>Username</label>
-          <input style={S.inp()} value={loginForm.username} onChange={e => setLoginForm(f => ({ ...f, username: e.target.value }))} />
+          <input style={S.inp()} value={loginForm.username} onChange={e=>setLoginForm(f=>({...f,username:e.target.value}))}/>
         </div>
-        <div style={{ marginBottom: 16 }}>
+        <div style={{marginBottom:16}}>
           <label style={S.lbl}>Password</label>
-          <input type="password" style={S.inp()} value={loginForm.password} onChange={e => setLoginForm(f => ({ ...f, password: e.target.value }))} onKeyDown={e => e.key === "Enter" && doLogin()} />
+          <input type="password" style={S.inp()} value={loginForm.password}
+            onChange={e=>setLoginForm(f=>({...f,password:e.target.value}))}
+            onKeyDown={e=>e.key==="Enter"&&doLogin()}/>
         </div>
-        {loginErr && <div style={{ color: "#ef4444", fontSize: 11, marginBottom: 10 }}>{loginErr}</div>}
-        <button style={{ ...S.btn(), width: "100%", padding: "10px" }} onClick={doLogin}>Login</button>
-        
-        <button 
-          onClick={syncWithOneDrive}
-          style={{ ...S.btn("#0078d4"), width: "100%", marginTop: 12, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
-        >
-          <RefreshCw size={14} className={syncing ? "animate-spin" : ""} />
-          {syncing ? "Connecting..." : "Sync OneDrive"}
-        </button>
+        {loginErr&&<div style={{color:"#ef4444",fontSize:11,marginBottom:10}}>{loginErr}</div>}
+        <button style={{...S.btn(),width:"100%",padding:"10px"}} onClick={doLogin}>Login</button>
+        {!odConnected
+          ? <button onClick={connectOD} disabled={syncing}
+              style={{...S.btn("#0078d4"),width:"100%",marginTop:12,display:"flex",alignItems:"center",justifyContent:"center",gap:8,opacity:syncing?0.7:1}}>
+              <RefreshCw size={14}/>{syncing?"Connecting…":"🔗 Connect OneDrive"}
+            </button>
+          : <button onClick={pullOD}
+              style={{...S.btn("#10b981"),width:"100%",marginTop:12,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+              <RefreshCw size={14}/>Refresh Data
+            </button>
+        }
+        <div style={{fontSize:10,color:"#64748b",marginTop:10,textAlign:"center"}}>
+          {odConnected
+            ? "☁ OneDrive connected — all devices share the same data"
+            : "Connect OneDrive so all colleagues see the same data"}
+        </div>
       </div>
     </div>
   );
 
-  const isHR = ["superadmin", "hrmanager", "hradmin"].includes(currentUser.role);
-  if (isHR) {
-    return <HRView currentUser={currentUser} employees={employees} setEmployees={setEmployees} outlets={outlets} setOutlets={setOutlets} users={users} setUsers={setUsers} transfers={transfers} setTransfers={setTransfers} onLogout={() => setCurrentUser(null)} tab={tab} setTab={setTab} onSync={syncWithOneDrive} />;
-  }
-  
-  return <StaffView currentUser={currentUser} employees={employees} outlets={outlets} onLogout={() => setCurrentUser(null)} isSupervisor={currentUser.role === "supervisor"} />;
+  const isHR = ["superadmin","hrmanager","hradmin"].includes(currentUser.role);
+  if (isHR) return (
+    <HRView
+      currentUser={currentUser}
+      employees={employees}   setEmployees={setEmp}
+      outlets={outlets}       setOutlets={setOut}
+      users={users}           setUsers={setUsr}
+      transfers={transfers}   setTransfers={setTr}
+      onLogout={()=>setCurrentUser(null)}
+      tab={tab} setTab={setTab}
+      onSync={pullOD}
+      syncBadge={syncBadge}
+    />
+  );
+  return <StaffView currentUser={currentUser} employees={employees} outlets={outlets}
+    onLogout={()=>setCurrentUser(null)} isSupervisor={currentUser.role==="supervisor"}/>;
 }
 function StaffView({currentUser,employees,outlets,onLogout,isSupervisor}){
   const [tab,setTab]=useState("mycerts");
@@ -437,7 +506,7 @@ function OutletCerts({currentUser,employees}){
   );
 }
 
-function HRView({currentUser,employees,setEmployees,outlets,setOutlets,users,setUsers,transfers,setTransfers,onLogout,tab,setTab}){
+function HRView({currentUser,employees,setEmployees,outlets,setOutlets,users,setUsers,transfers,setTransfers,onLogout,tab,setTab,onSync,syncBadge}:any){
   const [showForm,setShowForm]=useState(false);
   const [form,setForm]=useState(EMPTY_EMP);
   const [editId,setEditId]=useState(null);
@@ -720,8 +789,10 @@ function HRView({currentUser,employees,setEmployees,outlets,setOutlets,users,set
         <span style={{fontSize:11,color:"#94a3b8"}}>{currentUser.name}</span>
         <span style={S.badge("#6366f1")}>{ROLES[currentUser.role]}</span>
         {appraisalAlerts.length>0&&<span style={S.badge("#ef4444")}>⚠ {appraisalAlerts.length} appraisal{appraisalAlerts.length>1?"s":""} due</span>}
+        {syncBadge&&syncBadge()}
         <div style={{flex:1}}/>
         {isSA&&<button style={S.btn("#8b5cf6","5px 12px")} onClick={()=>setUserModal(true)}>🔑 Manage Users</button>}
+        <button style={{...S.btn("#0078d4","5px 12px"),display:"flex",alignItems:"center",gap:4}} onClick={onSync}><RefreshCw size={12}/>Sync</button>
         <button style={S.btn("#64748b","5px 12px")} onClick={onLogout}>Logout</button>
       </div>
       <div style={{display:"flex",gap:4,padding:"10px 16px",background:"#1a1a2e",borderBottom:"1px solid #2d2d4e",flexWrap:"wrap"}}>
