@@ -66,7 +66,7 @@ const msalConfig = {
   auth: {
     clientId: "9982e25d-66bc-41fa-b62b-2e73f6a96ea0",
     authority: "https://login.microsoftonline.com/fcd6a9af-1cde-4b3b-84bc-2eb80e1a40d9", 
-    redirectUri: "http://localhost:5173", // Back to main app
+    redirectUri: "https://your-app.vercel.app", // Back to main app
     navigateToLoginRequestUrl: false, 
   },
   cache: {
