@@ -60,12 +60,41 @@ const HOURS_COLORS: Record<string, string> = {
 };
 
 
-// ── MSAL Configuration ───────────────────────────────────────────────
-// APPROACH: Only the HR admin (you) signs into OneDrive.
-// The app saves BCH_HR_Data.json to YOUR OneDrive.
-// All colleagues just use username/password — they never touch OneDrive.
-// On every page load the app fetches the latest data from your OneDrive
-// using a stored token, so everyone always sees the same data.
+// ════════════════════════════════════════════════════════════════════
+// SYNC STRATEGY
+// ─────────────────────────────────────────────────────────────────
+// The data file (BCH_HR_Data.json) lives on the admin's SharePoint.
+//
+// READ  → Everyone fetches via the public share link (no login needed)
+// WRITE → Only the signed-in admin writes back via Graph API
+//
+// This means:
+//   • Colleagues just open the app, no Microsoft login required
+//   • Admin signs in once → all saves go to SharePoint automatically
+//   • HR team can open the JSON/Excel in SharePoint to inspect data
+// ════════════════════════════════════════════════════════════════════
+
+// ── Hardcoded share link — points to admin's BCH_HR_Data.json ────────
+// Convert SharePoint share URL to a direct download URL via Graph shares API
+const SP_SHARE_URL = "https://bchteams-my.sharepoint.com/:u:/g/personal/huiting_beechenghiang_com_sg/IQCymYQaSSgLTaLDJeAf3c-jAbwtq2NVwHkGgMgCHnr0-gs?e=QhyWfv";
+
+// Encode the share URL for use with Graph /shares endpoint
+function encodeShareUrl(url: string): string {
+  const b64 = btoa(url).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  return `u!${b64}`;
+}
+
+// Direct download URL using Graph shares API — works for any signed-in user
+const SHARE_ENCODED  = encodeShareUrl(SP_SHARE_URL);
+const GRAPH_READ_URL = `https://graph.microsoft.com/v1.0/shares/${SHARE_ENCODED}/driveItem/content`;
+const GRAPH_ROOT_URL = `https://graph.microsoft.com/v1.0/shares/${SHARE_ENCODED}/driveItem`;
+
+// ── Admin write path (SharePoint personal site) ───────────────────────
+const ADMIN_USER_ID  = "3f19e3c1-b6c6-46ee-a4ab-439a807f00ed";
+const DATA_FILE      = "BCH_HR_Data.json";
+const GRAPH_WRITE_URL = `https://graph.microsoft.com/v1.0/users/${ADMIN_USER_ID}/drive/root:/${DATA_FILE}:/content`;
+
+const GRAPH_SCOPES = ["Files.ReadWrite", "User.Read"];
 
 const msalConfig = {
   auth: {
@@ -77,10 +106,8 @@ const msalConfig = {
   cache: { cacheLocation: "localStorage", storeAuthStateInCookie: true }
 };
 const msalInstance = new PublicClientApplication(msalConfig);
-const GRAPH_SCOPES = ["Files.ReadWrite", "User.Read"];
-const OD_FILE = "BCH_HR_Data.json";
 
-// ── Token: silent first, popup fallback ──────────────────────────────
+// ── Token helper (only needed for writes) ────────────────────────────
 async function getToken(): Promise<string> {
   await msalInstance.initialize();
   const accounts = msalInstance.getAllAccounts();
@@ -94,33 +121,223 @@ async function getToken(): Promise<string> {
   }
 }
 
-// ── Admin's fixed user ID — everyone reads/writes THIS OneDrive ───────
-const ADMIN_USER_ID = "3f19e3c1-b6c6-46ee-a4ab-439a807f00ed";
+// ── EXCEL_BASE kept for compatibility (not used in JSON mode) ─────────
+const EXCEL_BASE = () => "";
 
-// ── Load from admin's OneDrive (works for any signed-in user) ─────────
-async function odLoad(): Promise<any | null> {
-  const token = await getToken();
+// ── Read a full worksheet as rows ─────────────────────────────────────
+async function xlsxReadSheet(token: string, sheet: string): Promise<any[][]> {
   const res = await fetch(
-    `https://graph.microsoft.com/v1.0/users/${ADMIN_USER_ID}/drive/root:/${OD_FILE}:/content`,
+    `${EXCEL_BASE()}/worksheets/${sheet}/usedRange`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`Load failed ${res.status}`);
-  return res.json();
+  if (res.status === 404) return [];
+  if (!res.ok) throw new Error(`Read sheet ${sheet} failed: ${res.status}`);
+  const data = await res.json();
+  return data.values || [];
 }
 
-// ── Save to admin's OneDrive (works for any signed-in user) ──────────
-async function odSave(data: any): Promise<void> {
-  const token = await getToken();
-  const res = await fetch(
-    `https://graph.microsoft.com/v1.0/users/${ADMIN_USER_ID}/drive/root:/${OD_FILE}:/content`,
+// ── Write rows to a worksheet (clears old data first) ────────────────
+async function xlsxWriteSheet(token: string, sheet: string, rows: any[][]): Promise<void> {
+  if (!rows.length) return;
+  const ncols = rows[0].length;
+  const nrows = rows.length;
+  const endCol = String.fromCharCode(64 + ncols); // e.g. 22 cols → V
+  const range  = `A1:${endCol}${nrows}`;
+
+  // First clear the old data range (leave row 1 title intact — start from row 2)
+  await fetch(
+    `${EXCEL_BASE()}/worksheets/${sheet}/range(address='A3:Z2000')/clear`,
+    { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ applyTo: "contents" }) }
+  );
+
+  // Write new data starting from row 3 (row 1=title banner, row 2=headers)
+  const dataRows  = rows;
+  const dataRange = `A3:${endCol}${2 + nrows}`;
+  await fetch(
+    `${EXCEL_BASE()}/worksheets/${sheet}/range(address='${dataRange}')`,
     {
-      method: "PUT",
+      method: "PATCH",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify(data)
+      body: JSON.stringify({ values: dataRows })
     }
   );
-  if (!res.ok) throw new Error(`Save failed ${res.status}`);
+}
+
+// ── Parse Excel rows → Employee objects ──────────────────────────────
+const TRAINING_MODULES_LOCAL = [
+  "Orientation","Food Safety","Customer Service","SOP Training",
+  "Fire Safety","First Aid","POS System","Product Knowledge",
+  "Cash Handling","Opening & Closing"
+];
+
+function rowsToEmployees(rows: any[][]): any[] {
+  if (rows.length < 2) return []; // no data rows
+  // Skip header rows — data starts at index 0 of what we receive (already sliced)
+  return rows.filter(r => r[0] && r[1]).map(r => {
+    const training: any = {};
+    // Result cols: index 3+len(modules) to 3+2*len(modules)-1  (0-based in the data slice)
+    // But we read from the Training sheet separately, so here just basic fields
+    return {
+      id:          r[0]  || "",
+      name:        r[1]  || "",
+      outlet:      r[2]  || "",
+      designation: r[3]  || "",
+      nationality: r[4]  || "",
+      passType:    r[5]  || "",
+      workType:    r[6]  || "ft",
+      ftHours:     r[7]  || "48hrs",
+      ptHours:     r[8]  || "",
+      joinDate:    r[9]  || "",
+      lastDay:     r[10] || "",
+      // r[11] = service (formula, skip)
+      pfile: {
+        probationEnd: r[12] || "",
+        contractEnd:  r[13] || "",
+        notes:        r[15] || "",
+        remarks:      r[16] || "",
+        photo:        r[17] || "",
+        docs: [], transfers: []
+      },
+      linkedUserId: r[14] || "",
+      training
+    };
+  });
+}
+
+function rowsToTraining(rows: any[][]): Record<string, any> {
+  // Returns map of employeeId -> training object
+  const map: Record<string,any> = {};
+  const mods = TRAINING_MODULES_LOCAL;
+  rows.filter(r => r[0]).forEach(r => {
+    const empId = String(r[0]);
+    const training: any = {};
+    mods.forEach((m, i) => {
+      const result = r[3 + i]  || "";
+      const date   = r[3 + mods.length + i] || "";
+      if (result || date) training[m] = { result: result || "", date: date || "" };
+    });
+    map[empId] = training;
+  });
+  return map;
+}
+
+function rowsToTransfers(rows: any[][]): any[] {
+  return rows.filter(r => r[0]).map(r => ({
+    id:      r[0] || Date.now(),
+    empId:   r[1] || "",
+    empName: r[2] || "",
+    from:    r[3] || "",
+    to:      r[4] || "",
+    date:    r[5] || "",
+    reason:  r[6] || ""
+  }));
+}
+
+function rowsToUsers(rows: any[][]): any[] {
+  return rows.filter(r => r[0] && r[1]).map(r => ({
+    id:       r[0] || "",
+    username: r[1] || "",
+    name:     r[2] || "",
+    role:     r[3] || "staff",
+    outlet:   r[4] || "",
+    pwdHash:  r[5] || ""
+  }));
+}
+
+function rowsToOutlets(rows: any[][]): string[] {
+  return rows.filter(r => r[0]).map(r => String(r[0]));
+}
+
+// ── Convert app data → Excel rows ─────────────────────────────────────
+function employeesToRows(emps: any[]): any[][] {
+  return emps.map(e => [
+    e.id, e.name, e.outlet, e.designation, e.nationality,
+    e.passType, e.workType, e.ftHours, e.ptHours || "",
+    e.joinDate, e.lastDay || "",
+    "", // service length — Excel formula handles this
+    e.pfile?.probationEnd || "", e.pfile?.contractEnd || "",
+    e.linkedUserId || "",
+    e.pfile?.notes || "", e.pfile?.remarks || "", e.pfile?.photo || "",
+    "", // training % — Excel formula
+    e.lastDay ? "Resigned" : "Active",
+    "", new Date().toISOString()
+  ]);
+}
+
+function trainingToRows(emps: any[]): any[][] {
+  const mods = TRAINING_MODULES_LOCAL;
+  return emps.map(e => {
+    const tr = e.training || {};
+    const results = mods.map(m => tr[m]?.result || "");
+    const dates   = mods.map(m => tr[m]?.date   || "");
+    return [e.id, e.name, e.outlet, ...results, ...dates, ""];
+  });
+}
+
+function transfersToRows(transfers: any[]): any[][] {
+  return transfers.map(t => [t.id, t.empId, t.empName, t.from, t.to, t.date, t.reason || ""]);
+}
+
+function usersToRows(users: any[]): any[][] {
+  return users.map(u => [u.id, u.username, u.name, u.role, u.outlet || "", u.pwdHash || "", new Date().toISOString()]);
+}
+
+function outletsToRows(outlets: string[]): any[][] {
+  return outlets.map(o => [o, "", "", "", ""]);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// LOAD — fetches the shared JSON from SharePoint via the share link
+// Works for ALL users — no Microsoft login required to read
+// ════════════════════════════════════════════════════════════════════
+async function xlsxLoadAll(): Promise<any | null> {
+  // Try with auth token first (for the admin who is signed in)
+  try {
+    const token = await getToken();
+    const res = await fetch(GRAPH_READ_URL, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (res.ok) return await res.json();
+  } catch {}
+
+  // Fallback: try anonymous fetch via the share link directly
+  // This works if the share link is set to "Anyone with the link"
+  try {
+    const res = await fetch(
+      `https://graph.microsoft.com/v1.0/shares/${SHARE_ENCODED}/driveItem/content`
+    );
+    if (res.ok) return await res.json();
+  } catch {}
+
+  // Last resort: try the raw SharePoint URL
+  try {
+    const base = SP_SHARE_URL.split("?")[0].replace("/:u:/g", "");
+    const res = await fetch(SP_SHARE_URL);
+    if (res.ok) return await res.json();
+  } catch {}
+
+  return null;
+}
+
+// ════════════════════════════════════════════════════════════════════
+// SAVE — writes JSON back to SharePoint (admin only, requires token)
+// ════════════════════════════════════════════════════════════════════
+async function xlsxSaveAll(data: { employees: any[], transfers: any[], users: any[], outlets: string[] }): Promise<void> {
+  const token = await getToken(); // will throw if not signed in
+  const res = await fetch(GRAPH_WRITE_URL, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      ...data,
+      savedAt: new Date().toISOString(),
+      savedBy: "BCH HR App"
+    })
+  });
+  if (!res.ok) throw new Error(`Save failed: ${res.status}`);
 }
 // ─────────────────────────────────────────────────────────────────────
 
@@ -283,13 +500,12 @@ export default function App() {
         await msalInstance.handleRedirectPromise();
         const accounts = msalInstance.getAllAccounts();
         if (accounts.length > 0) {
-          // MS token found — load from shared admin OneDrive
+          // Already signed in — load latest data from Excel
           setOdConnected(true);
           await pullOD();
         } else {
-          // No MS token — fall back to localStorage cache
-          const pulled = await pullPublic();
-          if (!pulled) localLoad();
+          // Not signed in — load from localStorage cache while they sign in
+          localLoad();
         }
       } catch {
         localLoad();
@@ -313,102 +529,55 @@ export default function App() {
     localStorage.setItem(K.transfers, JSON.stringify(tr));
   }
 
-  // ── Pull data — works for EVERYONE ──────────────────────────────────
-  // Admin: loads via Graph API (has OD token)
-  // Colleagues: loads via the public sharing link stored in localStorage
+  // ── Pull all data from Excel on OneDrive ─────────────────────────────
   async function pullOD() {
     setSyncStatus("loading");
     try {
-      const data = await odLoad();
+      const data = await xlsxLoadAll();
       if (data) {
-        if (data.employees) setEmployees(data.employees);
-        if (data.outlets)   setOutlets(data.outlets);
-        if (data.users)     setUsers(data.users);
-        if (data.transfers) setTransfers(data.transfers);
-        localSave(data.employees||[], data.outlets||OUTLETS_DEFAULT, data.users||DEFAULT_USERS, data.transfers||[]);
+        if (data.employees?.length) setEmployees(data.employees);
+        if (data.outlets?.length)   setOutlets(data.outlets);
+        if (data.users?.length)     setUsers(data.users);
+        if (data.transfers)         setTransfers(data.transfers);
+        localSave(
+          data.employees || [],
+          data.outlets   || OUTLETS_DEFAULT,
+          data.users     || DEFAULT_USERS,
+          data.transfers || []
+        );
       }
       setSyncStatus("ok");
     } catch (err) {
       console.error("Pull error:", err);
       setSyncStatus("error");
-      localLoad();
+      localLoad(); // fall back to cached data
     }
   }
 
-  // ── Pull via public share link (for colleagues, no OD login needed) ──
-  async function pullPublic() {
-    const shareUrl = localStorage.getItem("BCH_OD_SHARE_URL");
-    if (!shareUrl) return false;
-    setSyncStatus("loading");
-    try {
-      const res = await fetch(shareUrl);
-      if (!res.ok) throw new Error("fetch failed");
-      const data = await res.json();
-      if (data.employees) setEmployees(data.employees);
-      if (data.outlets)   setOutlets(data.outlets);
-      if (data.users)     setUsers(data.users);
-      if (data.transfers) setTransfers(data.transfers);
-      localSave(data.employees||[], data.outlets||OUTLETS_DEFAULT, data.users||DEFAULT_USERS, data.transfers||[]);
-      setSyncStatus("ok");
-      return true;
-    } catch {
-      setSyncStatus("error");
-      return false;
-    }
-  }
-
-  // ── Auto-save (admin only) + generate/store public share link ────────
-  function scheduleSave(emp=employees,out=outlets,usr=users,tr=transfers) {
-    localSave(emp, out, usr, tr);
+  // ── Save all data to Excel on OneDrive (debounced 3s) ─────────────
+  function scheduleSave(emp=employees, out=outlets, usr=users, tr=transfers) {
+    localSave(emp, out, usr, tr); // always cache locally immediately
     if (!odConnected) return;
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       setSyncStatus("saving");
       try {
-        await odSave({ employees:emp, outlets:out, users:usr, transfers:tr, savedAt:new Date().toISOString() });
-        // After saving, create/refresh a public sharing link so colleagues can read
-        await refreshShareLink();
+        await xlsxSaveAll({ employees: emp, outlets: out, users: usr, transfers: tr });
         setSyncStatus("ok");
-      } catch { setSyncStatus("error"); }
-    }, 2000);
-  }
-
-  // ── Create a public read-only sharing link for the data file ─────────
-  async function refreshShareLink() {
-    try {
-      const token = await getToken();
-      const res = await fetch(
-        `https://graph.microsoft.com/v1.0/me/drive/root:/${OD_FILE}:/createLink`,
-        {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ type: "view", scope: "anonymous" })
-        }
-      );
-      if (!res.ok) return;
-      const linkData = await res.json();
-      // Convert share URL to a direct download URL
-      const shareUrl = linkData.link?.webUrl;
-      if (shareUrl) {
-        // Transform share URL to direct content URL
-        const encoded = btoa(shareUrl).replace(/=/g,"").replace(/\+/g,"-").replace(/\//g,"_");
-        const directUrl = `https://api.onedrive.com/v1.0/shares/u!${encoded}/root/content`;
-        localStorage.setItem("BCH_OD_SHARE_URL", directUrl);
-        // Broadcast to all tabs/devices via a known key colleagues can read
-        localStorage.setItem("BCH_OD_SHARE_KEY", shareUrl);
+      } catch (err) {
+        console.error("Save error:", err);
+        setSyncStatus("error");
       }
-    } catch (err) {
-      console.error("Share link error:", err);
-    }
+    }, 3000); // 3s debounce — batches rapid changes into one write
   }
 
-  // Wrapped setters — every change triggers auto-save
+  // Wrapped setters — every state change auto-saves to Excel
   function setEmp(v:any){ const d=typeof v==="function"?v(employees):v; setEmployees(d); scheduleSave(d,outlets,users,transfers); }
   function setOut(v:any){ const d=typeof v==="function"?v(outlets):v;   setOutlets(d);   scheduleSave(employees,d,users,transfers); }
   function setUsr(v:any){ const d=typeof v==="function"?v(users):v;     setUsers(d);     scheduleSave(employees,outlets,d,transfers); }
   function setTr(v:any){  const d=typeof v==="function"?v(transfers):v; setTransfers(d); scheduleSave(employees,outlets,users,d); }
 
-  // ── Connect OneDrive (admin only) ────────────────────────────────────
+  // ── Sign in with Microsoft & load Excel ───────────────────────────
   async function connectOD() {
     setSyncing(true);
     try {
@@ -417,12 +586,12 @@ export default function App() {
       if (accounts.length > 0) {
         setOdConnected(true);
         await pullOD();
-        await refreshShareLink();
       } else {
+        // Redirect to Microsoft login — returns back to app automatically
         await msalInstance.loginRedirect({ scopes: GRAPH_SCOPES, prompt: "select_account" });
       }
     } catch (err:any) {
-      alert("OneDrive connection failed: " + err.message);
+      alert("Sign in failed: " + err.message);
     } finally { setSyncing(false); }
   }
 
@@ -468,20 +637,20 @@ export default function App() {
         </div>
         {loginErr&&<div style={{color:"#ef4444",fontSize:11,marginBottom:10}}>{loginErr}</div>}
         <button style={{...S.btn(),width:"100%",padding:"10px"}} onClick={doLogin}>Login</button>
-        {!odConnected
-          ? <button onClick={connectOD} disabled={syncing}
-              style={{...S.btn("#0078d4"),width:"100%",marginTop:12,display:"flex",alignItems:"center",justifyContent:"center",gap:8,opacity:syncing?0.7:1}}>
-              <RefreshCw size={14}/>{syncing?"Connecting…":"🔗 Sign in with Microsoft"}
-            </button>
-          : <button onClick={pullOD}
-              style={{...S.btn("#10b981"),width:"100%",marginTop:12,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
-              <RefreshCw size={14}/>Refresh Data
-            </button>
-        }
+        <button onClick={pullOD}
+          style={{...S.btn("#0078d4"),width:"100%",marginTop:8,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+          <RefreshCw size={14}/>Refresh Data
+        </button>
+        {!odConnected && (
+          <button onClick={connectOD} disabled={syncing}
+            style={{...S.btn("#8b5cf6"),width:"100%",marginTop:8,display:"flex",alignItems:"center",justifyContent:"center",gap:8,opacity:syncing?0.7:1}}>
+            <RefreshCw size={14}/>{syncing?"Connecting…":"🔑 Admin: Sign in to save changes"}
+          </button>
+        )}
         <div style={{fontSize:10,color:"#64748b",marginTop:10,textAlign:"center"}}>
           {odConnected
-            ? "☁ Connected — loading shared BCH data"
-            : "Sign in with your BCH Microsoft account to load shared data"}
+            ? "☁ Admin connected — changes save to SharePoint automatically"
+            : "Data loads from shared BCH SharePoint. Admin signs in to save changes."}
         </div>
       </div>
     </div>
