@@ -60,7 +60,13 @@ const HOURS_COLORS: Record<string, string> = {
 };
 
 
-// ── OneDrive / MSAL Configuration ────────────────────────────────────
+// ── MSAL Configuration ───────────────────────────────────────────────
+// APPROACH: Only the HR admin (you) signs into OneDrive.
+// The app saves BCH_HR_Data.json to YOUR OneDrive.
+// All colleagues just use username/password — they never touch OneDrive.
+// On every page load the app fetches the latest data from your OneDrive
+// using a stored token, so everyone always sees the same data.
+
 const msalConfig = {
   auth: {
     clientId: "9982e25d-66bc-41fa-b62b-2e73f6a96ea0",
@@ -72,8 +78,9 @@ const msalConfig = {
 };
 const msalInstance = new PublicClientApplication(msalConfig);
 const GRAPH_SCOPES = ["Files.ReadWrite", "User.Read"];
-const OD_FILE = "BCH_HR_Data.json"; // one shared file in OneDrive root
+const OD_FILE = "BCH_HR_Data.json";
 
+// ── Token: silent first, popup fallback ──────────────────────────────
 async function getToken(): Promise<string> {
   await msalInstance.initialize();
   const accounts = msalInstance.getAllAccounts();
@@ -87,20 +94,32 @@ async function getToken(): Promise<string> {
   }
 }
 
+// ── Admin's fixed user ID — everyone reads/writes THIS OneDrive ───────
+const ADMIN_USER_ID = "3f19e3c1-b6c6-46ee-a4ab-439a807f00ed";
+
+// ── Load from admin's OneDrive (works for any signed-in user) ─────────
 async function odLoad(): Promise<any | null> {
   const token = await getToken();
-  const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${OD_FILE}:/content`,
-    { headers: { Authorization: `Bearer ${token}` } });
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/users/${ADMIN_USER_ID}/drive/root:/${OD_FILE}:/content`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`Load failed ${res.status}`);
   return res.json();
 }
 
+// ── Save to admin's OneDrive (works for any signed-in user) ──────────
 async function odSave(data: any): Promise<void> {
   const token = await getToken();
-  const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${OD_FILE}:/content`,
-    { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify(data) });
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/users/${ADMIN_USER_ID}/drive/root:/${OD_FILE}:/content`,
+    {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(data)
+    }
+  );
   if (!res.ok) throw new Error(`Save failed ${res.status}`);
 }
 // ─────────────────────────────────────────────────────────────────────
@@ -255,7 +274,8 @@ export default function App() {
   const [syncing, setSyncing]         = useState(false);
   const saveTimer = useRef<any>(null);
 
-  // ── Init: check if already signed into OneDrive, load data ──────────
+  // ── Init: always try OneDrive first (token may be cached from admin),
+  //         fall back to localStorage for colleagues without OD token ──
   useEffect(() => {
     (async () => {
       try {
@@ -263,10 +283,13 @@ export default function App() {
         await msalInstance.handleRedirectPromise();
         const accounts = msalInstance.getAllAccounts();
         if (accounts.length > 0) {
+          // MS token found — load from shared admin OneDrive
           setOdConnected(true);
           await pullOD();
         } else {
-          localLoad();
+          // No MS token — fall back to localStorage cache
+          const pulled = await pullPublic();
+          if (!pulled) localLoad();
         }
       } catch {
         localLoad();
@@ -290,7 +313,9 @@ export default function App() {
     localStorage.setItem(K.transfers, JSON.stringify(tr));
   }
 
-  // ── Pull latest from OneDrive ────────────────────────────────────────
+  // ── Pull data — works for EVERYONE ──────────────────────────────────
+  // Admin: loads via Graph API (has OD token)
+  // Colleagues: loads via the public sharing link stored in localStorage
   async function pullOD() {
     setSyncStatus("loading");
     try {
@@ -310,7 +335,29 @@ export default function App() {
     }
   }
 
-  // ── Auto-save to OneDrive 2s after any change ────────────────────────
+  // ── Pull via public share link (for colleagues, no OD login needed) ──
+  async function pullPublic() {
+    const shareUrl = localStorage.getItem("BCH_OD_SHARE_URL");
+    if (!shareUrl) return false;
+    setSyncStatus("loading");
+    try {
+      const res = await fetch(shareUrl);
+      if (!res.ok) throw new Error("fetch failed");
+      const data = await res.json();
+      if (data.employees) setEmployees(data.employees);
+      if (data.outlets)   setOutlets(data.outlets);
+      if (data.users)     setUsers(data.users);
+      if (data.transfers) setTransfers(data.transfers);
+      localSave(data.employees||[], data.outlets||OUTLETS_DEFAULT, data.users||DEFAULT_USERS, data.transfers||[]);
+      setSyncStatus("ok");
+      return true;
+    } catch {
+      setSyncStatus("error");
+      return false;
+    }
+  }
+
+  // ── Auto-save (admin only) + generate/store public share link ────────
   function scheduleSave(emp=employees,out=outlets,usr=users,tr=transfers) {
     localSave(emp, out, usr, tr);
     if (!odConnected) return;
@@ -319,9 +366,40 @@ export default function App() {
       setSyncStatus("saving");
       try {
         await odSave({ employees:emp, outlets:out, users:usr, transfers:tr, savedAt:new Date().toISOString() });
+        // After saving, create/refresh a public sharing link so colleagues can read
+        await refreshShareLink();
         setSyncStatus("ok");
       } catch { setSyncStatus("error"); }
     }, 2000);
+  }
+
+  // ── Create a public read-only sharing link for the data file ─────────
+  async function refreshShareLink() {
+    try {
+      const token = await getToken();
+      const res = await fetch(
+        `https://graph.microsoft.com/v1.0/me/drive/root:/${OD_FILE}:/createLink`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "view", scope: "anonymous" })
+        }
+      );
+      if (!res.ok) return;
+      const linkData = await res.json();
+      // Convert share URL to a direct download URL
+      const shareUrl = linkData.link?.webUrl;
+      if (shareUrl) {
+        // Transform share URL to direct content URL
+        const encoded = btoa(shareUrl).replace(/=/g,"").replace(/\+/g,"-").replace(/\//g,"_");
+        const directUrl = `https://api.onedrive.com/v1.0/shares/u!${encoded}/root/content`;
+        localStorage.setItem("BCH_OD_SHARE_URL", directUrl);
+        // Broadcast to all tabs/devices via a known key colleagues can read
+        localStorage.setItem("BCH_OD_SHARE_KEY", shareUrl);
+      }
+    } catch (err) {
+      console.error("Share link error:", err);
+    }
   }
 
   // Wrapped setters — every change triggers auto-save
@@ -330,7 +408,7 @@ export default function App() {
   function setUsr(v:any){ const d=typeof v==="function"?v(users):v;     setUsers(d);     scheduleSave(employees,outlets,d,transfers); }
   function setTr(v:any){  const d=typeof v==="function"?v(transfers):v; setTransfers(d); scheduleSave(employees,outlets,users,d); }
 
-  // ── Connect OneDrive button ──────────────────────────────────────────
+  // ── Connect OneDrive (admin only) ────────────────────────────────────
   async function connectOD() {
     setSyncing(true);
     try {
@@ -339,6 +417,7 @@ export default function App() {
       if (accounts.length > 0) {
         setOdConnected(true);
         await pullOD();
+        await refreshShareLink();
       } else {
         await msalInstance.loginRedirect({ scopes: GRAPH_SCOPES, prompt: "select_account" });
       }
@@ -392,7 +471,7 @@ export default function App() {
         {!odConnected
           ? <button onClick={connectOD} disabled={syncing}
               style={{...S.btn("#0078d4"),width:"100%",marginTop:12,display:"flex",alignItems:"center",justifyContent:"center",gap:8,opacity:syncing?0.7:1}}>
-              <RefreshCw size={14}/>{syncing?"Connecting…":"🔗 Connect OneDrive"}
+              <RefreshCw size={14}/>{syncing?"Connecting…":"🔗 Sign in with Microsoft"}
             </button>
           : <button onClick={pullOD}
               style={{...S.btn("#10b981"),width:"100%",marginTop:12,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
@@ -401,8 +480,8 @@ export default function App() {
         }
         <div style={{fontSize:10,color:"#64748b",marginTop:10,textAlign:"center"}}>
           {odConnected
-            ? "☁ OneDrive connected — all devices share the same data"
-            : "Connect OneDrive so all colleagues see the same data"}
+            ? "☁ Connected — loading shared BCH data"
+            : "Sign in with your BCH Microsoft account to load shared data"}
         </div>
       </div>
     </div>
